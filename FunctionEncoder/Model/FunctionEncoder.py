@@ -2,6 +2,8 @@ from typing import Union, Tuple
 import torch
 from tqdm import trange
 from torch.utils.tensorboard import SummaryWriter
+import cvxpy as cp
+from cvxpylayers.torch import CvxpyLayer
 
 from FunctionEncoder.Callbacks.BaseCallback import BaseCallback
 from FunctionEncoder.Dataset.BaseDataset import BaseDataset
@@ -169,6 +171,9 @@ class FunctionEncoder(torch.nn.Module):
             gram = None
         elif method == "least_squares":
             representation, gram = self._compute_least_squares_representation(Gs, example_ys, **kwargs)
+        elif method == "constrained":
+            representation = self._compute_constrained_representation(Gs, example_ys, **kwargs)
+            gram = None
         else:
             raise ValueError(f"Unknown method: {method}")
 
@@ -428,7 +433,80 @@ class FunctionEncoder(torch.nn.Module):
         # Compute (G^TG)^-1 G^TF
         ls_representation = torch.einsum("fkl,fl->fk", gram_reg.inverse(), ip_representation) # this is just batch matrix multiplication
         return ls_representation, gram
+    
+    def _compute_constrained_representation(self,
+                                            Gs: torch.tensor,
+                                            example_ys: torch.tensor,
+                                            xc_iqs: torch.tensor = None,
+                                            b_iqs: torch.tensor = None,
+                                            xc_eqs: torch.tensor = None,
+                                            b_eqs: torch.tensor = None):
+        """ Computes the coefficients by solving a convex optimization problem with cvxpylayers.
+        
+        Args:
+        Gs: torch.tensor: The basis functions. Shape (n_functions, n_datapoints, output_size, n_basis)
+        example_ys: torch.tensor: The output data. Shape (n_functions, n_datapoints, output_size)
+        lambd: float: The regularization parameter. None by default. If None, scales with 1/n_datapoints.
+        
+        Returns:
+        torch.tensor: The coefficients of the basis functions. Shape (n_functions, n_basis)
+        torch.tensor: The gram matrix. Shape (n_functions, n_basis, n_basis)
+        """
 
+        assert len(Gs.shape)== 4, f"Expected Gs to have shape (f,d,m,k), got {Gs.shape}"
+        assert len(example_ys.shape) == 3, f"Expected example_ys to have shape (f,d,m), got {example_ys.shape}"
+        assert Gs.shape[0] == example_ys.shape[0], f"Expected Gs and example_ys to have the same number of functions, got {Gs.shape[0]} and {example_ys.shape[0]}"
+        assert Gs.shape[1] == example_ys.shape[1], f"Expected Gs and example_ys to have the same number of datapoints, got {Gs.shape[1]} and {example_ys.shape[1]}"
+        assert Gs.shape[2] == example_ys.shape[2], f"Expected Gs and example_ys to have the same output size, got {Gs.shape[2]} and {example_ys.shape[2]}"  
+
+        n_func, n_data, output_size, n_basis = Gs.shape
+        input_size = self.input_size[0]
+
+        # These are the coefficients of the function encoder
+        c = cp.Variable((n_basis, 1))
+        
+        # Flatten Gs and example_ys since cvxpy can only take 2D parameters
+        G = cp.Parameter((n_data, n_basis))
+        y = cp.Parameter((n_data, output_size))
+
+        # Write out the optimization problem in cvxpy
+        parameters = [G, y]
+        constraints = []
+        
+        if xc_iqs is not None:
+            if len(xc_iqs.shape) != 3:
+                xc_iqs = xc_iqs.reshape((1,-1,input_size))
+            F_iq = self.cvx_predict(xc_iqs, c)
+            constraints.append(F_iq <= b_iqs)
+        if xc_eqs is not None:
+            if len(xc_eqs.shape) != 3:
+                xc_eqs = xc_eqs.reshape((1,-1,input_size))
+            F_eq = self.cvx_predict(xc_eqs, c)
+            constraints.append(F_eq == b_eqs)
+
+        # solve optimization problem independently for each function
+        with torch.no_grad():
+            representations = []
+            for i in range(n_func):
+                Gi = Gs[i].flatten(start_dim=1)
+                example_yi = example_ys[i].requires_grad_(True)
+
+                # Write out the optimization problem in cvxpy
+                objective = cp.sum_squares(G @ c - y)
+                objective = cp.Minimize(objective)
+                problem = cp.Problem(objective, constraints)
+                assert problem.is_dpp()
+
+                # Wrap the problem into a cvxpylayer
+                cvxpylayer = CvxpyLayer(problem, parameters=parameters, variables=[c])
+
+                rep, = cvxpylayer(Gi, example_yi)
+                representations.append(rep)
+
+        representations = torch.cat(representations, dim=1).transpose(0,1)
+
+        return representations
+    
     def predict(self, 
                 xs:torch.tensor,
                 representations:torch.tensor, 
@@ -475,8 +553,8 @@ class FunctionEncoder(torch.nn.Module):
         example_xs: torch.tensor: The example input data used to compute a representation. Shape (n_example_datapoints, input_size)
         example_ys: torch.tensor: The example output data used to compute a representation. Shape (n_example_datapoints, output_size)
         xs: torch.tensor: The input data. Shape (n_functions, n_datapoints, input_size)
-        method: str: "inner_product" or "least_squares". Determines how to compute the coefficients of the basis functions.
-        kwargs: dict: Additional kwargs to pass to the least squares method.
+        method: str: "inner_product" or "least_squares" or "constrained". Determines how to compute the coefficients of the basis functions.
+        kwargs: dict: Additional kwargs to pass to the least squares or constrained method.
 
         Returns:
         torch.tensor: The predicted output. Shape (n_functions, n_datapoints, output_size)
@@ -495,12 +573,47 @@ class FunctionEncoder(torch.nn.Module):
         representations, _ = self.compute_representation(example_xs, example_ys, method=method, **kwargs)
         y_hats = self.predict(xs, representations)
         return y_hats
+    
+    def cvx_predict(self, 
+                    xs:torch.tensor,
+                    representations:torch.tensor,
+                    precomputed_average_ys:Union[torch.tensor, None]=None) -> torch.tensor:
+        """ Predicts the output of the function encoder given the input data and the coefficients of the basis functions. Uses the average function if it exists.
+
+        Args:
+        xs: torch.tensor: The input data. Shape (n_functions, n_datapoints, input_size)
+        representations: torch.tensor: The coefficients of the basis functions. Shape (n_basis, 1)
+        precomputed_average_ys: Union[torch.tensor, None]: The average function output. If None, computes it. Shape (n_functions, n_datapoints, output_size)
+        
+        Returns:
+        torch.tensor: The predicted output. Shape (n_functions, n_datapoints, output_size)
+        """
+
+        assert len(xs.shape) == 3, f"Expected xs to have shape (f,d,n), got {xs.shape}"
+        assert len(representations.shape) == 2, f"Expected representations to have shape (f,k), got {representations.shape}"
+
+        # this is weighted combination of basis functions
+        Gs = self.model.forward(xs)
+        Gs = Gs.detach().flatten(end_dim=2)
+        y_hats = Gs @ representations
+
+        # optionally add the average function
+        # it is allowed to be precomputed, which is helpful for training
+        # otherwise, compute it
+        if self.average_function:
+            if precomputed_average_ys is not None:
+                average_ys = precomputed_average_ys
+            else:
+                average_ys = self.average_function.forward(xs)
+            y_hats = y_hats + average_ys
+        return y_hats
 
     def train_model(self,
                     dataset: BaseDataset,
                     epochs: int,
                     progress_bar=True,
-                    callback:BaseCallback=None):
+                    callback:BaseCallback=None,
+                    rep_kwargs=None):
         """ Trains the function encoder on the dataset for some number of epochs.
         
         Args:
@@ -523,7 +636,7 @@ class FunctionEncoder(torch.nn.Module):
             callback.on_training_start(locals())
 
         # method to use for representation during training
-        assert self.method in ["inner_product", "least_squares"], f"Unknown method: {self.method}"
+        assert self.method in ["inner_product", "least_squares", "constrained"], f"Unknown method: {self.method}"
 
         losses = []
         bar = trange(epochs) if progress_bar else range(epochs)
@@ -544,7 +657,12 @@ class FunctionEncoder(torch.nn.Module):
                 expected_yhats = None
 
             # approximate functions, compute error
-            representation, gram = self.compute_representation(example_xs, example_ys, method=self.method)
+            representation, gram = None, None
+            if self.method == "constrained":
+                representation, gram = self.compute_representation(example_xs, example_ys, method=self.method, **rep_kwargs)
+            else:
+                representation, gram = self.compute_representation(example_xs, example_ys, method=self.method)
+            
             y_hats = self.predict(xs, representation, precomputed_average_ys=expected_yhats)
             prediction_loss = self._distance(y_hats, ys, squared=True).mean()
 
