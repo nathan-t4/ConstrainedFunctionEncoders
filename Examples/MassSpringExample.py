@@ -37,11 +37,11 @@ torch.manual_seed(seed)
 # create a dataset
 dataset = MassSpringDamperDataset(
     mass_range=(0.5, 5.0),
-    spring_constant_range=(0.1, 10.0),
-    damping_coefficient_range=(0.1, 5.0),
-    force_range=(-10, 10),
-    initial_position_range=(-5, 5),
-    initial_velocity_range=(-5, 5),
+    spring_constant_range=(0.1, 1.0),
+    damping_coefficient_range=(0.1, 1.0),
+    force_range=(-5.0, 5.0),
+    initial_position_range=(-1.0, 1.0),
+    initial_velocity_range=(-1.0, 1.0),
     dt=0.01,
     device=device,
 )

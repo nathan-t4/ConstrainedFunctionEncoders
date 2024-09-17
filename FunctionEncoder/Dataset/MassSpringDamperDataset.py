@@ -33,7 +33,6 @@ class MassSpringDamperDataset(BaseDataset):
         self.initial_velocity_range = torch.tensor(initial_velocity_range, device=self.device)
         self.dt = dt  # Time step
 
-    @torch.compile
     def sample(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         with torch.no_grad():
             n_parameters = self.n_functions_per_sample
@@ -44,7 +43,7 @@ class MassSpringDamperDataset(BaseDataset):
             masses = torch.rand((n_parameters, 1), dtype=torch.float32, device=self.device) * (self.mass_range[1] - self.mass_range[0]) + self.mass_range[0]
             spring_constants = torch.rand((n_parameters, 1), dtype=torch.float32, device=self.device) * (self.spring_constant_range[1] - self.spring_constant_range[0]) + self.spring_constant_range[0]
             damping_coefficients = torch.rand((n_parameters, 1), dtype=torch.float32, device=self.device) * (self.damping_coefficient_range[1] - self.damping_coefficient_range[0]) + self.damping_coefficient_range[0]
-
+            
             @torch.compile
             def integrate_dynamics(n_parameters, n_examples, initial_pos, initial_vel, forces):
                 xs = torch.zeros((n_parameters, n_examples, 1), dtype=torch.float32, device=self.device)
