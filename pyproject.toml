@@ -16,7 +16,9 @@ dependencies = [
     "torch>=2.0",
     "tqdm",
     "tensorboard",
-    "numpy<=1.26.4"
+    "numpy<=1.26.4",
+    "cvxpy",
+    "cvxpylayers",
 ]
 
 [project.urls]

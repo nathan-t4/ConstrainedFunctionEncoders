@@ -83,24 +83,29 @@ else:
 with torch.no_grad():
     n_plots = 9
     n_examples = 100
-    example_time_points, example_ys, time_points, ys, info = dataset.sample()
-    example_time_points, example_ys = example_time_points[:, :n_examples, :], example_ys[:, :n_examples, :]
+    example_xs, example_ys, xs, ys, info = dataset.sample()
+    example_xs, example_ys = example_xs[:, :n_examples, :], example_ys[:, :n_examples, :]
     if train_method == "inner_product":
-        y_hats_ip = model.predict_from_examples(example_time_points, example_ys, time_points, method="inner_product")
-    y_hats_ls = model.predict_from_examples(example_time_points, example_ys, time_points, method="least_squares")
-    time_points, indices = torch.sort(time_points, dim=-2)
-    ys = ys.gather(dim=-2, index=indices)
-    y_hats_ls = y_hats_ls.gather(dim=-2, index=indices)
+        y_hats_ip = model.predict_from_examples(example_xs, example_ys, xs, method="inner_product")
+    y_hats_ls = model.predict_from_examples(example_xs, example_ys, xs, method="least_squares")
+    sorted_indices = torch.argsort(xs[:,:,0], dim=1)
+    xs = torch.gather(xs, 1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.input_size))
+    # xs, indices = torch.sort(xs, dim=-2)   
+    # ys = ys.gather(dim=-2, index=indices)
+    # y_hats_ls = y_hats_ls.gather(dim=-2, index=indices)
+    ys = ys.gather(1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.output_size))
+    y_hats_ls = y_hats_ls.gather(1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.output_size))
     if train_method == "inner_product":
-        y_hats_ip = y_hats_ip.gather(dim=-2, index=indices)
+        # y_hats_ip = y_hats_ip.gather(dim=-2, index=indices)
+        y_hats_ip = y_hats_ip.gather(1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.output_size))
 
     fig, axs = plt.subplots(3, 3, figsize=(15, 10))
     for i in range(n_plots):
         ax = axs[i // 3, i % 3]
-        ax.plot(time_points[i].cpu(), ys[i].cpu(), label="True")
-        ax.plot(time_points[i].cpu(), y_hats_ls[i].cpu(), label="LS")
+        ax.plot(xs[i].cpu(), ys[i].cpu(), label="True")
+        ax.plot(xs[i].cpu(), y_hats_ls[i].cpu(), label="LS")
         if train_method == "inner_product":
-            ax.plot(time_points[i].cpu(), y_hats_ip[i].cpu(), label="IP")
+            ax.plot(xs[i].cpu(), y_hats_ip[i].cpu(), label="IP")
         if i == n_plots - 1:
             ax.legend()
         title = f"Mass: {info['masses'][i].item():.2f}, k: {info['spring_constants'][i].item():.2f}, c: {info['damping_coefficients'][i].item():.2f}"
@@ -112,15 +117,15 @@ with torch.no_grad():
     plt.savefig(f"{logdir}/plot.png")
     plt.clf()
 
-    # plot the basis functions
-    fig, ax = plt.subplots(1, 1, figsize=(15, 10))
-    time_points = torch.linspace(0, 1, 1_000).reshape(1000, 1).to(device)  # Adjust the time range as needed
-    basis = model.model.forward(time_points)
-    for i in range(n_basis):
-        ax.plot(time_points.flatten().cpu(), basis[:, 0, i].cpu(), color="black")
-    if residuals:
-        avg_function = model.average_function.forward(time_points)
-        ax.plot(time_points.flatten().cpu(), avg_function.flatten().cpu(), color="blue")
+    # TODO: plot the basis functions; basis functions will not be 2D
+    # fig, ax = plt.subplots(1, 1, figsize=(15, 10))
+    # xs = torch.linspace(0, 1, 1_000).reshape(1000, *dataset.input_size).to(device)  # Adjust the time range as needed
+    # basis = model.model.forward(xs)
+    # for i in range(n_basis):
+    #     ax.plot(xs.flatten().cpu(), basis[:, 0, i].cpu(), color="black")
+    # if residuals:
+    #     avg_function = model.average_function.forward(xs)
+    #     ax.plot(xs.flatten().cpu(), avg_function.flatten().cpu(), color="blue")
 
-    plt.tight_layout()
-    plt.savefig(f"{logdir}/basis.png")
+    # plt.tight_layout()
+    # plt.savefig(f"{logdir}/basis.png")
