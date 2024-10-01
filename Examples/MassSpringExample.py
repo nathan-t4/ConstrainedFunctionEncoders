@@ -5,11 +5,15 @@ from FunctionEncoder import FunctionEncoder, MSECallback, ListCallback, Tensorbo
 import argparse
 from FunctionEncoder.Dataset.MassSpringDamperDataset import MassSpringDamperDataset
 
+# TODO: Problems: loss is not converging. Fixed problem by minimizing randomization
+# TODO: Prediction is inaccurate. Since we have f(x) and x_0, unless loss converges to 1e-6, or else the predictions will not be accurate.
+# TODO: try training with sequential predictions instead of batch predictions
+
 # parse args
 parser = argparse.ArgumentParser()
 parser.add_argument("--n_basis", type=int, default=11)
 parser.add_argument("--train_method", type=str, default="least_squares")
-parser.add_argument("--epochs", type=int, default=1_000)
+parser.add_argument("--epochs", type=int, default=1_000) # 1_000
 parser.add_argument("--load_path", type=str, default=None)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--residuals", action="store_true")
@@ -18,7 +22,8 @@ args = parser.parse_args()
 # hyper params
 epochs = args.epochs
 n_basis = args.n_basis
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 train_method = args.train_method
 seed = args.seed
 load_path = args.load_path
@@ -36,13 +41,14 @@ torch.manual_seed(seed)
 
 # create a dataset
 dataset = MassSpringDamperDataset(
-    mass_range=(0.5, 5.0),
-    spring_constant_range=(0.1, 1.0),
-    damping_coefficient_range=(0.1, 1.0),
-    force_range=(-5.0, 5.0),
-    initial_position_range=(-1.0, 1.0),
-    initial_velocity_range=(-1.0, 1.0),
-    dt=0.01,
+    mass_range=(0.8, 1.0),
+    spring_constant_range=(0.8, 1.0),
+    damping_coefficient_range=(0.8, 1.0),
+    force_range=(-0.1, 0.1),
+    initial_position_range=(-0.1, 0.1),
+    initial_velocity_range=(-0.1, 0.1),
+    dt=1e-3, # changing dt does not do anything
+    control_type="sinusoidal",
     device=device,
 )
 
@@ -82,35 +88,43 @@ else:
 # plot
 with torch.no_grad():
     n_plots = 9
-    n_examples = 100
+    n_examples = 500
     example_xs, example_ys, xs, ys, info = dataset.sample()
-    example_xs, example_ys = example_xs[:, :n_examples, :], example_ys[:, :n_examples, :]
-    if train_method == "inner_product":
-        y_hats_ip = model.predict_from_examples(example_xs, example_ys, xs, method="inner_product")
-    y_hats_ls = model.predict_from_examples(example_xs, example_ys, xs, method="least_squares")
-    sorted_indices = torch.argsort(xs[:,:,0], dim=1)
-    xs = torch.gather(xs, 1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.input_size))
-    # xs, indices = torch.sort(xs, dim=-2)   
-    # ys = ys.gather(dim=-2, index=indices)
-    # y_hats_ls = y_hats_ls.gather(dim=-2, index=indices)
-    ys = ys.gather(1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.output_size))
-    y_hats_ls = y_hats_ls.gather(1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.output_size))
-    if train_method == "inner_product":
-        # y_hats_ip = y_hats_ip.gather(dim=-2, index=indices)
-        y_hats_ip = y_hats_ip.gather(1, sorted_indices.unsqueeze(-1).repeat(1,1,*dataset.output_size))
+    example_t_idxs = torch.randperm(dataset.n_examples_per_sample)[:n_examples]
+    example_xs, example_ys = example_xs[:, example_t_idxs, :], example_ys[:, example_t_idxs, :]
+
+    # Get initial position
+    y_hats = []
+    prev_x = xs[:,0,1]
+    representations, _ = model.compute_representation(example_xs, example_ys, train_method)
+
+    # Sequential prediction
+    for k in range(xs.shape[1]):
+        t = xs[:,k,0]
+        force = xs[:,k,2]
+        xs_k = torch.stack([t,prev_x,force], dim=0)
+        xs_k = xs_k.T.unsqueeze(dim=1)
+        y_hats.append(model.predict(xs_k, representations))
+        prev_x = y_hats[k].squeeze()
+
+    y_hats = torch.cat(y_hats, dim=1)
+
+    # Fake prediction
+    y_hats = model.predict_from_examples(example_xs, example_ys, xs, method=train_method)
 
     fig, axs = plt.subplots(3, 3, figsize=(15, 10))
     for i in range(n_plots):
         ax = axs[i // 3, i % 3]
-        ax.plot(xs[i].cpu(), ys[i].cpu(), label="True")
-        ax.plot(xs[i].cpu(), y_hats_ls[i].cpu(), label="LS")
-        if train_method == "inner_product":
-            ax.plot(xs[i].cpu(), y_hats_ip[i].cpu(), label="IP")
+        time_axis = xs[i,:,0].cpu()
+        ax.plot(time_axis, ys[i].cpu(), label="True")
+        ax.plot(time_axis, y_hats[i].cpu(), label=f"{train_method}")
         if i == n_plots - 1:
             ax.legend()
-        title = f"Mass: {info['masses'][i].item():.2f}, k: {info['spring_constants'][i].item():.2f}, c: {info['damping_coefficients'][i].item():.2f}"
+        title = f"Mass: {info['masses'][i].item():.2f}, k: {info['spring_constants'][i].item():.2f}, c: {info['damping_coefficients'][i].item():.2f}, ||F||: {info['forces_magnitude'][i].item():.2f}"
         ax.set_title(title)
-        y_min, y_max = ys[i].min().item(), ys[i].max().item()
+        # y_min, y_max = ys[i].min().item(), ys[i].max().item()
+        y_min = min(ys[i].min().item(), y_hats[i].min().item())
+        y_max = max(ys[i].max().item(), y_hats[i].max().item())
         ax.set_ylim(y_min, y_max)
 
     plt.tight_layout()
