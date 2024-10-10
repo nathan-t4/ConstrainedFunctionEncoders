@@ -2,6 +2,7 @@ from typing import Union, Tuple
 import torch
 from tqdm import trange
 from torch.utils.tensorboard import SummaryWriter
+from torch.autograd.functional import jacobian, jvp
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 
@@ -32,7 +33,8 @@ class FunctionEncoder(torch.nn.Module):
                  n_basis:int=100, 
                  model_type:Union[str, type]="MLP",
                  model_kwargs:dict=dict(),
-                 method:str="least_squares", 
+                 method:str="least_squares",
+                 prediction_method:str="batch", 
                  use_residuals_method:bool=False,  
                  regularization_parameter:float=1.0, 
                  gradient_accumulation:int=1,
@@ -57,6 +59,7 @@ class FunctionEncoder(torch.nn.Module):
         assert len(output_size) == 1, "Only 1D output supported for now"
         assert output_size[0] >= 1, "Output size must be at least 1"
         assert data_type in ["deterministic", "stochastic", "categorical"], f"Unknown data type: {data_type}"
+        assert prediction_method in ["batch", "sequential"], f"Unknown prediction method: {prediction_method}"
         super(FunctionEncoder, self).__init__()
         
         # hyperparameters
@@ -64,6 +67,7 @@ class FunctionEncoder(torch.nn.Module):
         self.output_size = output_size
         self.n_basis = n_basis
         self.method = method
+        self.prediction_method = prediction_method
         self.data_type = data_type
         
         # models and optimizers
@@ -440,7 +444,9 @@ class FunctionEncoder(torch.nn.Module):
                                             xc_iqs: torch.tensor = None,
                                             b_iqs: torch.tensor = None,
                                             xc_eqs: torch.tensor = None,
-                                            b_eqs: torch.tensor = None):
+                                            b_eqs: torch.tensor = None,
+                                            xc_grad_eqs: torch.tensor = None,
+                                            b_grad_eqs: torch.tensor = None):
         """ Computes the coefficients by solving a convex optimization problem with cvxpylayers.
         
         Args:
@@ -483,6 +489,11 @@ class FunctionEncoder(torch.nn.Module):
                 xc_eqs = xc_eqs.reshape((1,-1,input_size))
             F_eq = self.cvx_predict(xc_eqs, c)
             constraints.append(F_eq == b_eqs)
+        # if xc_grad_eqs is not None:
+        #     if len(xc_grad_eqs.shape) != 3:
+        #         xc_grad_eqs = xc_grad_eqs.reshape((1,-1,input_size))
+        #     F_eq = self.cvx_predict(xc_grad_eqs, c)
+        #     constraints.append(jacobian(F_eq) == b_grad_eqs)
 
         # solve optimization problem independently for each function
         with torch.no_grad():
@@ -526,9 +537,31 @@ class FunctionEncoder(torch.nn.Module):
         assert len(representations.shape) == 2, f"Expected representations to have shape (f,k), got {representations.shape}"
         assert xs.shape[0] == representations.shape[0], f"Expected xs and representations to have the same number of functions, got {xs.shape[0]} and {representations.shape[0]}"
 
-        # this is weighted combination of basis functions
-        Gs = self.model.forward(xs)
-        y_hats = torch.einsum("fdmk,fk->fdm", Gs, representations)
+        # print("xs shape", xs.shape)
+        # print("x_k shape", xs[:,0,:].shape, xs[:,0,:].unsqueeze(1).shape)
+        # print("batch Gs shape", self.model.forward(xs).shape)
+        # print("sequential Gs shape", self.model.forward(xs[:,0,:].unsqueeze(1)).shape)
+        # print("batch y_hats shape", torch.einsum("fdmk,fk->fdm", self.model.forward(xs), representations).shape)
+        # print("sequential y_hats shape", torch.einsum("fdmk,fk->fdm", self.model.forward(xs[:,0,:].unsqueeze(1)), representations).shape)
+        # print("representations shape", representations.shape)
+
+         # this is weighted combination of basis functions
+        if self.prediction_method == "batch":
+            # evaluate Gs in batches
+            Gs = self.model.forward(xs)
+            y_hats = torch.einsum("fdmk,fk->fdm", Gs, representations)
+        elif self.prediction_method == "sequential":
+            # evaluate Gs in sequentially. make sure timesteps are sorted.
+            y_hats = []
+            x_k = xs[:,0,1:3].unsqueeze(1)
+            for k in range(xs.shape[1]):
+                t = xs[:,k,0].reshape(-1,1,1)
+                x_k = torch.concatenate((t,x_k), dim=-1)
+                Gs = self.model.forward(x_k)
+                x_k = torch.einsum("fdmk,fk->fdm", Gs, representations)
+                y_hats.append(x_k)
+
+            y_hats = torch.tensor(y_hats, dtype=torch.float32)
         
         # optionally add the average function
         # it is allowed to be precomputed, which is helpful for training
