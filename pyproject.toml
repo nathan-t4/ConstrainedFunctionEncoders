@@ -19,6 +19,8 @@ dependencies = [
     "numpy<=1.26.4",
     "cvxpy",
     "cvxpylayers",
+    "slycot",
+    "control",
 ]
 
 [project.urls]

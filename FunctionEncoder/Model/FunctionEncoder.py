@@ -561,7 +561,7 @@ class FunctionEncoder(torch.nn.Module):
                 x_k = torch.einsum("fdmk,fk->fdm", Gs, representations)
                 y_hats.append(x_k)
 
-            y_hats = torch.tensor(y_hats, dtype=torch.float32)
+            y_hats = torch.cat(y_hats, dim=1)
         
         # optionally add the average function
         # it is allowed to be precomputed, which is helpful for training
@@ -640,12 +640,19 @@ class FunctionEncoder(torch.nn.Module):
                 average_ys = self.average_function.forward(xs)
             y_hats = y_hats + average_ys
         return y_hats
+    
+    def _add_noise(self, y_hats, noise_std):
+        """ Add noise to predictions """
+        epsilon = torch.normal(torch.tensor(0.0), torch.tensor(noise_std)) # scale to [-1,1)
+        epsilon = epsilon * noise_std
+        return y_hats + epsilon
 
     def train_model(self,
                     dataset: BaseDataset,
                     epochs: int,
                     progress_bar=True,
                     callback:BaseCallback=None,
+                    noise_std:float = 0.0,
                     rep_kwargs=None):
         """ Trains the function encoder on the dataset for some number of epochs.
         
@@ -697,6 +704,8 @@ class FunctionEncoder(torch.nn.Module):
                 representation, gram = self.compute_representation(example_xs, example_ys, method=self.method)
             
             y_hats = self.predict(xs, representation, precomputed_average_ys=expected_yhats)
+            # add noise during training
+            y_hats = self._add_noise(y_hats, noise_std)
             prediction_loss = self._distance(y_hats, ys, squared=True).mean()
 
             # LS requires regularization since it does not care about the scale of basis

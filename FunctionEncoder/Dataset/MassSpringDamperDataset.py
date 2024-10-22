@@ -17,6 +17,7 @@ class MassSpringDamperDataset(BaseDataset):
                  n_points_per_sample: int = 10_000, # 10_000
                  horizon_timesteps: int = 1,
                  control_type: str = "sinusoidal",
+                 residuals: bool = False,
                  device: str = "auto"):
         super().__init__(input_size=(3,),  # time, position, force # TODO: position, velocity
                          output_size=(2,),
@@ -36,6 +37,7 @@ class MassSpringDamperDataset(BaseDataset):
         self.dt_range = dt_range  
         self.horizon_timesteps = horizon_timesteps
         self.control_type = control_type
+        self.residuals = residuals
 
     def sample(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         with torch.no_grad():
@@ -52,6 +54,7 @@ class MassSpringDamperDataset(BaseDataset):
             def integrate_dynamics(n_parameters, n_examples, initial_pos, initial_vel, forces, dt):
                 xs = torch.zeros((n_parameters, n_examples, 2), dtype=torch.float32, device=self.device)
                 ys = torch.zeros((n_parameters, n_examples, *self.output_size), dtype=torch.float32, device=self.device)
+
                 for i in range(n_parameters):
                     mass = masses[i]
                     k = spring_constants[i]
@@ -73,6 +76,10 @@ class MassSpringDamperDataset(BaseDataset):
                     # Predict one time step ahead
                     xs[i] = torch.cat((y[:-1], y_dot[:-1]), dim=-1)
                     ys[i] = torch.cat((y[1:], y_dot[1:]), dim=-1)
+
+                    # if self.residuals:
+                    #     # Calculate dx
+                    #     xs[i] = torch.cat((y[1:] - y[:-1], y_dot[1:] - y_dot[:-1]), dim=-1)
                 
                 return xs, ys
             
@@ -138,8 +145,10 @@ class MassSpringDamperDataset(BaseDataset):
             # xs = torch.cat([time_points, xs, forces[:,:-1]], dim=-1)
             # example_xs = torch.cat([example_time_points, example_xs, example_forces[:,:-1]], dim=-1)
 
-            # TODO: remove timestep k from input
-            xs = torch.cat([time_points, xs], dim=-1)
-            example_xs = torch.cat([example_time_points, example_xs], dim=-1)
-
+            # Inputs are [dt, x]
+            dts = torch.tile(dt, (1,n_points,1)).transpose(2,0)
+            xs = torch.cat([dts, xs], dim=-1)
+            example_dts = torch.tile(example_dt, (1,n_examples,1)).transpose(2,0)
+            example_xs = torch.cat([example_dts, example_xs], dim=-1)
+            
             return example_xs, example_ys, xs, ys, dataset_cfg
